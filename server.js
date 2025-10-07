@@ -96,13 +96,7 @@ bot.start(async (ctx) => {
   await ctx.reply(`🎉 Event Created! ID: ${eventId}\nEnter welcome text (max 100 chars):`);
 });
 
-// Bot Text Handler
-bot.on('text', async (ctx) => {
-  const userId = ctx.from.id.toString();
-  const userState = userStates.get(userId);
-  if (!userState) return;
 
-  const text = ctx.message.text;
 
   switch (userState.step) {
     case 'welcomeText':
@@ -127,7 +121,19 @@ bot.on('text', async (ctx) => {
       await ctx.reply('✅ Now send background image:');
       break;
 
-    case 'serviceType':
+    case 'service
+      // Bot Text Handler
+bot.on('text', async (ctx) => {
+  // ✅ Skip all commands like /done, /disable, etc.
+  if (ctx.message.text.startsWith('/')) return;
+
+  const userId = ctx.from.id.toString();
+  const userState = userStates.get(userId);
+  if (!userState) return;
+
+  const text = ctx.message.text;
+  
+  Type':
       if (!['/both', '/viewalbum', '/uploadpics'].includes(text)) {
         await ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
         return;
