@@ -98,8 +98,8 @@ bot.start(async (ctx) => {
 
 // Bot Text Handler
 bot.on('text', async (ctx) => {
-  // ✅ FIX: Prevent commands like /done or /disable from being intercepted
-  if (ctx.message.text.startsWith('/')) return;
+  // ✅ Allow service type commands but skip major bot commands
+  if (['/done', '/disable', '/start'].includes(ctx.message.text)) return;
 
   const userId = ctx.from.id.toString();
   const userState = userStates.get(userId);
@@ -182,7 +182,6 @@ bot.on('photo', async (ctx) => {
     const fileLink = await bot.telegram.getFileLink(fileId);
     const tempPath = `temp-${Date.now()}.jpg`;
     
-    // Download image using https
     const fileStream = fs.createWriteStream(tempPath);
     https.get(fileLink.href, (response) => {
       response.pipe(fileStream);
@@ -211,7 +210,7 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Bot /done Command - FIXED VERSION
+// Bot /done Command
 bot.command('done', async (ctx) => {
   try {
     const userId = ctx.from.id.toString();
@@ -223,15 +222,12 @@ bot.command('done', async (ctx) => {
     if (userState && userState.step === 'preloadedPhotos') {
       await ctx.reply('⏳ Creating your event...');
       
-      // Create event in database
       const event = new Event(userState.eventData);
       await event.save();
       console.log(`✅ Event saved: ${userState.eventData.eventId}`);
 
-      // Save preloaded photos to Photo collection
       if (userState.eventData.preloadedPhotos && userState.eventData.preloadedPhotos.length > 0) {
         console.log(`📸 Saving ${userState.eventData.preloadedPhotos.length} preloaded photos...`);
-        
         for (const photo of userState.eventData.preloadedPhotos) {
           await new Photo({
             eventId: userState.eventData.eventId,
@@ -244,7 +240,6 @@ bot.command('done', async (ctx) => {
       }
 
       const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
-      
       await ctx.reply(
         `🎊 *Event Setup Complete!*\n\n` +
         `*Event ID:* ${userState.eventData.eventId}\n` +
@@ -253,8 +248,7 @@ bot.command('done', async (ctx) => {
         `Use /disable to stop uploads anytime.`,
         { parse_mode: 'Markdown' }
       );
-      
-      // Clean up user state
+
       userStates.delete(userId);
       console.log(`✅ User state cleaned up for: ${userId}`);
       
@@ -311,7 +305,6 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ error: 'Uploads not allowed' });
     }
 
-    // Check upload limit
     const guestUploadsCount = await Photo.countDocuments({ 
       eventId: req.params.eventId, 
       uploadType: 'guest',
@@ -322,13 +315,11 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ error: 'Upload limit reached' });
     }
 
-    // Upload to Cloudinary
     const uploadResult = await cloudinary.uploader.upload(req.file.path, { 
       folder: `events/${req.params.eventId}`,
       quality: 'auto'
     });
 
-    // Save to database
     const photo = new Photo({
       eventId: req.params.eventId,
       public_id: uploadResult.public_id,
