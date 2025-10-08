@@ -37,7 +37,11 @@ const eventSchema = new mongoose.Schema({
     min: 50,
     max: 5000
   },
-  preloadedPhotos: [{ public_id: String, url: String, uploadedAt: { type: Date, default: Date.now } }],
+  preloadedPhotos: [{ 
+    public_id: String, 
+    url: String, 
+    uploadedAt: { type: Date, default: Date.now } 
+  }],
   createdBy: { type: String, required: true },
   status: { type: String, enum: ['active', 'disabled'], default: 'active' },
   createdAt: { type: Date, default: Date.now }
@@ -90,7 +94,8 @@ if (bot) {
       eventData: { 
         eventId, 
         createdBy: userId,
-        preloadedPhotos: []
+        preloadedPhotos: [],
+        status: 'active'
       }
     });
 
@@ -169,7 +174,7 @@ if (bot) {
     }
   });
 
-  // Bot Photo Handler - NO FILE I/O
+  // Bot Photo Handler - FIXED: INCLUDES UPLOADED AT TIMESTAMP
   bot.on('photo', async (ctx) => {
     const userId = ctx.from.id.toString();
     const userState = userStates.get(userId);
@@ -187,7 +192,14 @@ if (bot) {
         await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
       } else if (userState.step === 'preloadedPhotos') {
         const uploadResult = await uploadRemoteUrlToCloudinary(fileLink.href, 'events/preloaded');
-        userState.eventData.preloadedPhotos.push(uploadResult);
+        
+        // FIX: Include ALL required fields for MongoDB
+        userState.eventData.preloadedPhotos.push({
+          public_id: uploadResult.public_id,
+          url: uploadResult.url,
+          uploadedAt: new Date()  // CRITICAL: This was missing!
+        });
+        
         userStates.set(userId, userState);
         await ctx.reply('✅ Photo added! Send more or /done');
       }
@@ -197,7 +209,7 @@ if (bot) {
     }
   });
 
-  // Bot /done Command - SIMPLIFIED
+  // Bot /done Command - FIXED: SAVES TO MONGODB WITH DEBUG LOGGING
   bot.command('done', async (ctx) => {
     try {
       const userId = ctx.from.id.toString();
@@ -208,21 +220,32 @@ if (bot) {
         return;
       }
 
-      await ctx.reply('⏳ Creating your event...');
+      console.log('🎯 /done command triggered');
+      console.log('📊 Event data to save:', userState.eventData);
+      console.log('🖼️ Preloaded photos count:', userState.eventData.preloadedPhotos.length);
 
-      // Save event and photos
+      await ctx.reply('⏳ Saving your event to database...');
+
+      // SAVE EVENT TO MONGODB
       const event = new Event(userState.eventData);
       await event.save();
+      console.log('✅ Event saved to MongoDB');
 
+      // SAVE PRELOADED PHOTOS TO MONGODB
       if (userState.eventData.preloadedPhotos.length > 0) {
+        console.log('💾 Saving photos to MongoDB...');
         for (const photo of userState.eventData.preloadedPhotos) {
-          await new Photo({
+          const photoDoc = new Photo({
             eventId: userState.eventData.eventId,
             public_id: photo.public_id,
             url: photo.url,
-            uploadType: 'preloaded'
-          }).save();
+            uploadType: 'preloaded',
+            uploadedAt: photo.uploadedAt || new Date()
+          });
+          await photoDoc.save();
+          console.log('✅ Photo saved:', photo.public_id);
         }
+        console.log('🎊 All photos saved to MongoDB');
       }
 
       const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
@@ -236,11 +259,13 @@ if (bot) {
         { parse_mode: 'Markdown' }
       );
 
+      // Clean up only after successful save
       userStates.delete(userId);
+      console.log('✅ User state cleaned up');
       
     } catch (error) {
-      console.error('❌ /done error:', error);
-      await ctx.reply('❌ Failed to create event');
+      console.error('❌ /done command failed:', error);
+      await ctx.reply('❌ Failed to create event: ' + error.message);
     }
   });
 
