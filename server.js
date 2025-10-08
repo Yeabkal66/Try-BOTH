@@ -5,7 +5,6 @@ const cors = require('cors');
 const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
-const fs = require('fs');
 
 const app = express();
 app.use(cors());
@@ -61,7 +60,7 @@ const Photo = mongoose.model('Photo', photoSchema);
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 
-// Upload remote URL directly to Cloudinary - ADVISOR'S FIX
+// Upload remote URL directly to Cloudinary
 const uploadRemoteUrlToCloudinary = async (url, folder = 'events') => {
   const result = await cloudinary.uploader.upload(url, { 
     folder, 
@@ -162,7 +161,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Bot Photo Handler - ADVISOR'S FIX (NO FILE I/O)
+// Bot Photo Handler - NO FILE I/O
 bot.on('photo', async (ctx) => {
   const userId = ctx.from.id.toString();
   const userState = userStates.get(userId);
@@ -190,7 +189,7 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Bot /done Command - GUARANTEED WORKING
+// Bot /done Command - FIXED: SAVES EVENT TO DATABASE
 bot.command('done', async (ctx) => {
   try {
     const userId = ctx.from.id.toString();
@@ -201,7 +200,24 @@ bot.command('done', async (ctx) => {
       return;
     }
 
-    // SEND EVENT LINK IMMEDIATELY
+    await ctx.reply('⏳ Saving your event...');
+
+    // FIX 1: SAVE EVENT TO DATABASE BEFORE SENDING LINK
+    const event = new Event(userState.eventData);
+    await event.save();
+
+    // FIX 1: SAVE PRELOADED PHOTOS TO DATABASE
+    if (userState.eventData.preloadedPhotos.length > 0) {
+      for (const photo of userState.eventData.preloadedPhotos) {
+        await new Photo({
+          eventId: userState.eventData.eventId,
+          public_id: photo.public_id,
+          url: photo.url,
+          uploadType: 'preloaded'
+        }).save();
+      }
+    }
+
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
     
     await ctx.reply(
@@ -213,12 +229,12 @@ bot.command('done', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
-    // Clean up
+    // Clean up only AFTER saving to database
     userStates.delete(userId);
     
   } catch (error) {
     console.error('❌ /done error:', error);
-    await ctx.reply('❌ Failed to create event');
+    await ctx.reply('❌ Failed to create event: ' + error.message);
   }
 });
 
@@ -232,8 +248,55 @@ bot.command('disable', (ctx) => {
 // Start Bot
 bot.launch().then(() => console.log('🤖 Telegram Bot Started'));
 
-// API Routes
-const upload = multer({ dest: 'uploads/' });
+// FIX 2: MEMORY STORAGE FOR GUEST UPLOADS
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
+
+// Upload Guest Photo - FIXED: MEMORY STORAGE
+app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
+  try {
+    const event = await Event.findOne({ eventId: req.params.eventId });
+    if (!event || event.status === 'disabled' || event.serviceType === 'viewalbum') {
+      return res.status(400).json({ error: 'Uploads not allowed' });
+    }
+
+    // Check upload limit
+    const guestUploadsCount = await Photo.countDocuments({ 
+      eventId: req.params.eventId, 
+      uploadType: 'guest',
+      'uploaderInfo.ip': req.ip 
+    });
+
+    if (guestUploadsCount >= event.uploadLimit) {
+      return res.status(400).json({ error: 'Upload limit reached' });
+    }
+
+    // FIX 2: UPLOAD FROM MEMORY BUFFER (NO FILE SYSTEM)
+    const b64 = Buffer.from(req.file.buffer).toString('base64');
+    const dataUri = "data:" + req.file.mimetype + ";base64," + b64;
+    
+    const uploadResult = await cloudinary.uploader.upload(dataUri, { 
+      folder: `events/${req.params.eventId}`,
+      quality: 'auto'
+    });
+
+    // Save to database
+    const photo = new Photo({
+      eventId: req.params.eventId,
+      public_id: uploadResult.public_id,
+      url: uploadResult.secure_url,
+      uploadType: 'guest',
+      uploaderInfo: { ip: req.ip, userAgent: req.get('User-Agent') }
+    });
+
+    await photo.save();
+
+    res.json({ success: true, photo });
+  } catch (error) {
+    console.error('Upload API error:', error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
 
 // Get Event Details
 app.get('/api/events/:eventId', async (req, res) => {
@@ -253,39 +316,6 @@ app.get('/api/events/:eventId', async (req, res) => {
   } catch (error) {
     console.error('Events API error:', error);
     res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Upload Guest Photo
-app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
-  try {
-    const event = await Event.findOne({ eventId: req.params.eventId });
-    if (!event || event.status === 'disabled' || event.serviceType === 'viewalbum') {
-      return res.status(400).json({ error: 'Uploads not allowed' });
-    }
-
-    // Upload to Cloudinary
-    const uploadResult = await cloudinary.uploader.upload(req.file.path, { 
-      folder: `events/${req.params.eventId}`,
-      quality: 'auto'
-    });
-
-    // Save to database
-    const photo = new Photo({
-      eventId: req.params.eventId,
-      public_id: uploadResult.public_id,
-      url: uploadResult.secure_url,
-      uploadType: 'guest',
-      uploaderInfo: { ip: req.ip, userAgent: req.get('User-Agent') }
-    });
-
-    await photo.save();
-    fs.unlinkSync(req.file.path);
-
-    res.json({ success: true, photo });
-  } catch (error) {
-    console.error('Upload API error:', error);
-    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
