@@ -1,4 +1,4 @@
-require('dotenv').config();
+Require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -60,7 +60,7 @@ const Photo = mongoose.model('Photo', photoSchema);
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 
-// Upload remote URL directly to Cloudinary
+// Cloudinary Helper: Upload remote URL directly to Cloudinary
 const uploadRemoteUrlToCloudinary = async (url, folder = 'events') => {
   const result = await cloudinary.uploader.upload(url, { 
     folder, 
@@ -121,6 +121,7 @@ bot.on('text', async (ctx) => {
       break;
 
     case 'serviceType':
+      // Existing logic for service type handling
       if (!['/both', '/viewalbum', '/uploadpics'].includes(text)) {
         await ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
         return;
@@ -161,7 +162,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Bot Photo Handler - NO FILE I/O
+// Bot Photo Handler - NO FILE I/O (Correct)
 bot.on('photo', async (ctx) => {
   const userId = ctx.from.id.toString();
   const userState = userStates.get(userId);
@@ -189,35 +190,37 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Bot /done Command - FIXED: SAVES EVENT TO DATABASE
+// Bot /done Command - FINAL CRITICAL FIX: Parallel DB Saves
 bot.command('done', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userState = userStates.get(userId);
+  
+  if (!userState) {
+    return ctx.reply('❌ No event in progress. Use /start first.');
+  }
+
+  // 1. Acknowledge immediately to keep the connection alive
+  await ctx.reply('⏳ Saving your event... Please wait.');
+
   try {
-    const userId = ctx.from.id.toString();
-    const userState = userStates.get(userId);
-    
-    if (!userState) {
-      await ctx.reply('❌ No event in progress. Use /start first.');
-      return;
-    }
-
-    await ctx.reply('⏳ Saving your event...');
-
-    // FIX 1: SAVE EVENT TO DATABASE BEFORE SENDING LINK
+    // 2. Prepare Event and Photo promises
     const event = new Event(userState.eventData);
-    await event.save();
+    const saveEventPromise = event.save();
 
-    // FIX 1: SAVE PRELOADED PHOTOS TO DATABASE
-    if (userState.eventData.preloadedPhotos.length > 0) {
-      for (const photo of userState.eventData.preloadedPhotos) {
-        await new Photo({
-          eventId: userState.eventData.eventId,
-          public_id: photo.public_id,
-          url: photo.url,
-          uploadType: 'preloaded'
-        }).save();
-      }
-    }
+    // Convert preloadedPhotos to Photo documents and create save promises
+    const photoPromises = userState.eventData.preloadedPhotos.map(photo => {
+      return new Photo({
+        eventId: userState.eventData.eventId,
+        public_id: photo.public_id,
+        url: photo.url,
+        uploadType: 'preloaded'
+      }).save();
+    });
 
+    // 3. Wait for ALL promises to resolve concurrently (Parallel processing)
+    await Promise.all([saveEventPromise, ...photoPromises]);
+    
+    // 4. Send final success message
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
     
     await ctx.reply(
@@ -229,12 +232,12 @@ bot.command('done', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
-    // Clean up only AFTER saving to database
-    userStates.delete(userId);
-    
   } catch (error) {
-    console.error('❌ /done error:', error);
-    await ctx.reply('❌ Failed to create event: ' + error.message);
+    console.error('❌ CRITICAL /done error (DB Timeout/Failure):', error);
+    await ctx.reply(`❌ Critical failure during event creation. Please check logs.`);
+  } finally {
+    // 5. Clean up state only AFTER attempting save
+    userStates.delete(userId);
   }
 });
 
@@ -248,11 +251,34 @@ bot.command('disable', (ctx) => {
 // Start Bot
 bot.launch().then(() => console.log('🤖 Telegram Bot Started'));
 
-// FIX 2: MEMORY STORAGE FOR GUEST UPLOADS
+// FIX 2: MEMORY STORAGE FOR GUEST UPLOADS (Correct)
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// Upload Guest Photo - FIXED: MEMORY STORAGE
+// API Routes
+
+// Get Event Details (Correct)
+app.get('/api/events/:eventId', async (req, res) => {
+  try {
+    const event = await Event.findOne({ eventId: req.params.eventId });
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+
+    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
+    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
+
+    res.json({
+      event,
+      preloadedPhotos,
+      guestPhotos,
+      uploadEnabled: event.status === 'active' && event.serviceType !== 'viewalbum'
+    });
+  } catch (error) {
+    console.error('Events API error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Upload Guest Photo - FIXED: MEMORY STORAGE (Correct)
 app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   try {
     const event = await Event.findOne({ eventId: req.params.eventId });
@@ -271,7 +297,7 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ error: 'Upload limit reached' });
     }
 
-    // FIX 2: UPLOAD FROM MEMORY BUFFER (NO FILE SYSTEM)
+    // UPLOAD FROM MEMORY BUFFER (NO FILE SYSTEM)
     const b64 = Buffer.from(req.file.buffer).toString('base64');
     const dataUri = "data:" + req.file.mimetype + ";base64," + b64;
     
@@ -298,28 +324,7 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   }
 });
 
-// Get Event Details
-app.get('/api/events/:eventId', async (req, res) => {
-  try {
-    const event = await Event.findOne({ eventId: req.params.eventId });
-    if (!event) return res.status(404).json({ error: 'Event not found' });
-
-    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
-    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
-
-    res.json({
-      event,
-      preloadedPhotos,
-      guestPhotos,
-      uploadEnabled: event.status === 'active' && event.serviceType !== 'viewalbum'
-    });
-  } catch (error) {
-    console.error('Events API error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Get Album Photos
+// Get Album Photos (Correct)
 app.get('/api/album/:eventId', async (req, res) => {
   try {
     const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
@@ -331,7 +336,7 @@ app.get('/api/album/:eventId', async (req, res) => {
   }
 });
 
-// Health Check
+// Health Check (Correct)
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
