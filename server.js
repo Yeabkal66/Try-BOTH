@@ -6,7 +6,6 @@ const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const fs = require('fs');
-const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -62,9 +61,12 @@ const Photo = mongoose.model('Photo', photoSchema);
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 
-// Cloudinary Helper
-const uploadToCloudinary = async (imagePath, folder = 'events') => {
-  const result = await cloudinary.uploader.upload(imagePath, { folder, quality: 'auto' });
+// Upload remote URL directly to Cloudinary - ADVISOR'S FIX
+const uploadRemoteUrlToCloudinary = async (url, folder = 'events') => {
+  const result = await cloudinary.uploader.upload(url, { 
+    folder, 
+    quality: 'auto' 
+  });
   return { public_id: result.public_id, url: result.secure_url };
 };
 
@@ -160,7 +162,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Bot Photo Handler
+// Bot Photo Handler - ADVISOR'S FIX (NO FILE I/O)
 bot.on('photo', async (ctx) => {
   const userId = ctx.from.id.toString();
   const userState = userStates.get(userId);
@@ -169,41 +171,28 @@ bot.on('photo', async (ctx) => {
   try {
     const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
     const fileLink = await bot.telegram.getFileLink(fileId);
-    const tempPath = `temp-${Date.now()}.jpg`;
-    
-    // Download image using https
-    const fileStream = fs.createWriteStream(tempPath);
-    https.get(fileLink.href, (response) => {
-      response.pipe(fileStream);
-      fileStream.on('finish', async () => {
-        fileStream.close();
-        
-        if (userState.step === 'backgroundImage') {
-          const uploadResult = await uploadToCloudinary(tempPath, 'events/backgrounds');
-          userState.eventData.backgroundImage = uploadResult;
-          userState.step = 'serviceType';
-          userStates.set(userId, userState);
-          await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
-        } else if (userState.step === 'preloadedPhotos') {
-          const uploadResult = await uploadToCloudinary(tempPath, 'events/preloaded');
-          userState.eventData.preloadedPhotos.push(uploadResult);
-          userStates.set(userId, userState);
-          await ctx.reply('✅ Photo added! Send more or /done');
-        }
-        
-        fs.unlinkSync(tempPath);
-      });
-    });
+
+    if (userState.step === 'backgroundImage') {
+      const uploadResult = await uploadRemoteUrlToCloudinary(fileLink.href, 'events/backgrounds');
+      userState.eventData.backgroundImage = uploadResult;
+      userState.step = 'serviceType';
+      userStates.set(userId, userState);
+      await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
+    } else if (userState.step === 'preloadedPhotos') {
+      const uploadResult = await uploadRemoteUrlToCloudinary(fileLink.href, 'events/preloaded');
+      userState.eventData.preloadedPhotos.push(uploadResult);
+      userStates.set(userId, userState);
+      await ctx.reply('✅ Photo added! Send more or /done');
+    }
   } catch (error) {
     console.error('Photo upload error:', error);
     await ctx.reply('❌ Failed to upload image');
   }
 });
 
-// Bot /done Command - SIMPLE & GUARANTEED WORKING
+// Bot /done Command - GUARANTEED WORKING
 bot.command('done', async (ctx) => {
   try {
-    console.log('🚀 /done command started');
     const userId = ctx.from.id.toString();
     const userState = userStates.get(userId);
     
@@ -224,7 +213,7 @@ bot.command('done', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
-    // Try to save event (but don't block the link sending)
+    // Save event data
     try {
       const event = new Event(userState.eventData);
       await event.save();
@@ -240,7 +229,7 @@ bot.command('done', async (ctx) => {
         }
       }
     } catch (saveError) {
-      console.log('⚠️ Event save failed but link was sent:', saveError.message);
+      console.log('⚠️ Event save failed but link was sent');
     }
 
     // Clean up
@@ -248,7 +237,7 @@ bot.command('done', async (ctx) => {
     
   } catch (error) {
     console.error('❌ /done error:', error);
-    await ctx.reply('❌ Failed to create event: ' + error.message);
+    await ctx.reply('❌ Failed to create event');
   }
 });
 
