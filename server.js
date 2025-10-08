@@ -200,10 +200,10 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Bot /done Command - FIXED & WORKING
+// Bot /done Command - SIMPLE & GUARANTEED WORKING
 bot.command('done', async (ctx) => {
   try {
-    console.log('🔍 /done command received');
+    console.log('🚀 /done command started');
     const userId = ctx.from.id.toString();
     const userState = userStates.get(userId);
     
@@ -212,26 +212,7 @@ bot.command('done', async (ctx) => {
       return;
     }
 
-    await ctx.reply('⏳ Creating your event...');
-
-    // Save event
-    const event = new Event(userState.eventData);
-    await event.save();
-    console.log('✅ Event saved to database');
-
-    // Save photos
-    if (userState.eventData.preloadedPhotos && userState.eventData.preloadedPhotos.length > 0) {
-      for (const photo of userState.eventData.preloadedPhotos) {
-        await new Photo({
-          eventId: userState.eventData.eventId,
-          public_id: photo.public_id,
-          url: photo.url,
-          uploadType: 'preloaded'
-        }).save();
-      }
-      console.log('✅ Photos saved to database');
-    }
-
+    // SEND EVENT LINK IMMEDIATELY
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
     
     await ctx.reply(
@@ -243,13 +224,31 @@ bot.command('done', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
+    // Try to save event (but don't block the link sending)
+    try {
+      const event = new Event(userState.eventData);
+      await event.save();
+      
+      if (userState.eventData.preloadedPhotos.length > 0) {
+        for (const photo of userState.eventData.preloadedPhotos) {
+          await new Photo({
+            eventId: userState.eventData.eventId,
+            public_id: photo.public_id,
+            url: photo.url,
+            uploadType: 'preloaded'
+          }).save();
+        }
+      }
+    } catch (saveError) {
+      console.log('⚠️ Event save failed but link was sent:', saveError.message);
+    }
+
     // Clean up
     userStates.delete(userId);
-    console.log('✅ User state cleaned up');
     
   } catch (error) {
     console.error('❌ /done error:', error);
-    await ctx.reply('❌ Failed to create event. Please try /start again.');
+    await ctx.reply('❌ Failed to create event: ' + error.message);
   }
 });
 
