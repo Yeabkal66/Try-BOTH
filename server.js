@@ -213,25 +213,6 @@ bot.command('done', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
-    // Save event data
-    try {
-      const event = new Event(userState.eventData);
-      await event.save();
-      
-      if (userState.eventData.preloadedPhotos.length > 0) {
-        for (const photo of userState.eventData.preloadedPhotos) {
-          await new Photo({
-            eventId: userState.eventData.eventId,
-            public_id: photo.public_id,
-            url: photo.url,
-            uploadType: 'preloaded'
-          }).save();
-        }
-      }
-    } catch (saveError) {
-      console.log('⚠️ Event save failed but link was sent');
-    }
-
     // Clean up
     userStates.delete(userId);
     
@@ -281,17 +262,6 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
     const event = await Event.findOne({ eventId: req.params.eventId });
     if (!event || event.status === 'disabled' || event.serviceType === 'viewalbum') {
       return res.status(400).json({ error: 'Uploads not allowed' });
-    }
-
-    // Check upload limit
-    const guestUploadsCount = await Photo.countDocuments({ 
-      eventId: req.params.eventId, 
-      uploadType: 'guest',
-      'uploaderInfo.ip': req.ip 
-    });
-
-    if (guestUploadsCount >= event.uploadLimit) {
-      return res.status(400).json({ error: 'Upload limit reached' });
     }
 
     // Upload to Cloudinary
