@@ -78,7 +78,11 @@ bot.start(async (ctx) => {
   
   userStates.set(userId, {
     step: 'welcomeText',
-    eventData: { eventId, createdBy: userId }
+    eventData: { 
+      eventId, 
+      createdBy: userId,
+      preloadedPhotos: []
+    }
   });
 
   await ctx.reply(`🎉 Event Created! ID: ${eventId}\nEnter welcome text (max 100 chars):`);
@@ -100,6 +104,7 @@ bot.on('text', async (ctx) => {
       }
       userState.eventData.welcomeText = text;
       userState.step = 'description';
+      userStates.set(userId, userState);
       await ctx.reply('✅ Now enter description (max 200 chars):');
       break;
 
@@ -110,6 +115,7 @@ bot.on('text', async (ctx) => {
       }
       userState.eventData.description = text;
       userState.step = 'backgroundImage';
+      userStates.set(userId, userState);
       await ctx.reply('✅ Now send background image:');
       break;
 
@@ -120,6 +126,7 @@ bot.on('text', async (ctx) => {
       }
       userState.eventData.serviceType = text.replace('/', '');
       userState.step = 'uploadLimit';
+      userStates.set(userId, userState);
       await ctx.reply('✅ Enter upload limit (50-5000):');
       break;
 
@@ -131,6 +138,7 @@ bot.on('text', async (ctx) => {
       }
       userState.eventData.uploadLimit = limit;
       userState.step = 'preloadedPhotos';
+      userStates.set(userId, userState);
       await ctx.reply('✅ Now send preloaded photos (type /done when finished):');
       break;
 
@@ -150,8 +158,6 @@ bot.on('text', async (ctx) => {
       userStates.delete(userId);
       break;
   }
-
-  userStates.set(userId, userState);
 });
 
 // Bot Photo Handler
@@ -176,16 +182,16 @@ bot.on('photo', async (ctx) => {
           const uploadResult = await uploadToCloudinary(tempPath, 'events/backgrounds');
           userState.eventData.backgroundImage = uploadResult;
           userState.step = 'serviceType';
+          userStates.set(userId, userState);
           await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
         } else if (userState.step === 'preloadedPhotos') {
-          if (!userState.eventData.preloadedPhotos) userState.eventData.preloadedPhotos = [];
           const uploadResult = await uploadToCloudinary(tempPath, 'events/preloaded');
           userState.eventData.preloadedPhotos.push(uploadResult);
+          userStates.set(userId, userState);
           await ctx.reply('✅ Photo added! Send more or /done');
         }
         
         fs.unlinkSync(tempPath);
-        userStates.set(userId, userState);
       });
     });
   } catch (error) {
@@ -194,9 +200,10 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Bot /done Command - SIMPLE & WORKING
+// Bot /done Command - FIXED & WORKING
 bot.command('done', async (ctx) => {
   try {
+    console.log('🔍 /done command received');
     const userId = ctx.from.id.toString();
     const userState = userStates.get(userId);
     
@@ -207,12 +214,13 @@ bot.command('done', async (ctx) => {
 
     await ctx.reply('⏳ Creating your event...');
 
-    // Save event to database
+    // Save event
     const event = new Event(userState.eventData);
     await event.save();
+    console.log('✅ Event saved to database');
 
-    // Save preloaded photos
-    if (userState.eventData.preloadedPhotos) {
+    // Save photos
+    if (userState.eventData.preloadedPhotos && userState.eventData.preloadedPhotos.length > 0) {
       for (const photo of userState.eventData.preloadedPhotos) {
         await new Photo({
           eventId: userState.eventData.eventId,
@@ -221,6 +229,7 @@ bot.command('done', async (ctx) => {
           uploadType: 'preloaded'
         }).save();
       }
+      console.log('✅ Photos saved to database');
     }
 
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
@@ -236,10 +245,11 @@ bot.command('done', async (ctx) => {
 
     // Clean up
     userStates.delete(userId);
+    console.log('✅ User state cleaned up');
     
   } catch (error) {
     console.error('❌ /done error:', error);
-    await ctx.reply('❌ Failed to create event: ' + error.message);
+    await ctx.reply('❌ Failed to create event. Please try /start again.');
   }
 });
 
