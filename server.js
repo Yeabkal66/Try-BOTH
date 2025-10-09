@@ -1,21 +1,21 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
 const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
+const admin = require('firebase-admin');
+
+// Firebase Admin Initialization
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => console.log('✅ MongoDB Connected'))
-.catch(err => console.error('❌ MongoDB Error:', err));
 
 // Cloudinary Config
 cloudinary.config({
@@ -23,42 +23,6 @@ cloudinary.config({
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
-
-// MongoDB Models
-const eventSchema = new mongoose.Schema({
-  eventId: { type: String, required: true, unique: true },
-  welcomeText: { type: String, required: true, maxlength: 100 },
-  description: { type: String, required: true, maxlength: 200 },
-  backgroundImage: { public_id: String, url: String },
-  serviceType: { type: String, enum: ['both', 'viewalbum', 'uploadpics'], default: 'both' },
-  uploadLimit: { 
-    type: Number, 
-    default: 100,
-    min: 50,
-    max: 5000
-  },
-  preloadedPhotos: [{ 
-    public_id: String, 
-    url: String, 
-    uploadedAt: { type: Date, default: Date.now } 
-  }],
-  createdBy: { type: String, required: true },
-  status: { type: String, enum: ['active', 'disabled'], default: 'active' },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const photoSchema = new mongoose.Schema({
-  eventId: { type: String, required: true },
-  public_id: { type: String, required: true },
-  url: { type: String, required: true },
-  uploadType: { type: String, enum: ['preloaded', 'guest'], required: true },
-  uploaderInfo: { ip: String, userAgent: String },
-  approved: { type: Boolean, default: true },
-  uploadedAt: { type: Date, default: Date.now }
-});
-
-const Event = mongoose.model('Event', eventSchema);
-const Photo = mongoose.model('Photo', photoSchema);
 
 // Telegram Bot
 let bot;
@@ -87,26 +51,34 @@ const autoCompleteEvent = async (ctx, userState) => {
   try {
     await ctx.reply('⏳ All photos received! Creating your event...');
 
-    // SAVE EVENT TO MONGODB
-    const event = new Event(userState.eventData);
-    await event.save();
-    console.log('✅ Event saved to MongoDB');
+    // SAVE EVENT TO FIRESTORE
+    const eventData = {
+      ...userState.eventData,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
 
-    // SAVE PRELOADED PHOTOS TO MONGODB
+    await db.collection('events').doc(userState.eventData.eventId).set(eventData);
+    console.log('✅ Event saved to Firestore');
+
+    // SAVE PRELOADED PHOTOS TO FIRESTORE
     if (userState.eventData.preloadedPhotos.length > 0) {
-      console.log('💾 Saving photos to MongoDB...');
+      console.log('💾 Saving photos to Firestore...');
+      
       for (const photo of userState.eventData.preloadedPhotos) {
-        const photoDoc = new Photo({
+        const photoData = {
           eventId: userState.eventData.eventId,
           public_id: photo.public_id,
           url: photo.url,
           uploadType: 'preloaded',
-          uploadedAt: photo.uploadedAt || new Date()
-        });
-        await photoDoc.save();
+          uploadedAt: photo.uploadedAt || new Date(),
+          approved: true
+        };
+        
+        await db.collection('photos').add(photoData);
         console.log('✅ Photo saved:', photo.public_id);
       }
-      console.log('🎊 All photos saved to MongoDB');
+      console.log('🎊 All photos saved to Firestore');
     }
 
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
@@ -220,13 +192,15 @@ if (bot) {
 
       case 'eventIdForDisable':
         try {
-          const event = await Event.findOne({ eventId: text });
-          if (!event) {
+          const eventDoc = await db.collection('events').doc(text).get();
+          if (!eventDoc.exists) {
             await ctx.reply('❌ Event not found');
             return;
           }
-          event.status = 'disabled';
-          await event.save();
+          await db.collection('events').doc(text).update({
+            status: 'disabled',
+            updatedAt: new Date()
+          });
           await ctx.reply(`✅ Uploads disabled for event: ${text}`);
         } catch (error) {
           await ctx.reply('❌ Failed to disable event');
@@ -301,14 +275,34 @@ const upload = multer({ storage: storage });
 
 // API Routes
 
-// Get Event Details
+// Get Event Details - FIRESTORE VERSION
 app.get('/api/events/:eventId', async (req, res) => {
   try {
-    const event = await Event.findOne({ eventId: req.params.eventId });
-    if (!event) return res.status(404).json({ error: 'Event not found' });
+    const eventDoc = await db.collection('events').doc(req.params.eventId).get();
+    if (!eventDoc.exists) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
 
-    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
-    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
+    const event = eventDoc.data();
+
+    // Get preloaded photos
+    const preloadedPhotosSnapshot = await db.collection('photos')
+      .where('eventId', '==', req.params.eventId)
+      .where('uploadType', '==', 'preloaded')
+      .orderBy('uploadedAt', 'desc')
+      .get();
+    
+    const preloadedPhotos = preloadedPhotosSnapshot.docs.map(doc => doc.data());
+
+    // Get guest photos
+    const guestPhotosSnapshot = await db.collection('photos')
+      .where('eventId', '==', req.params.eventId)
+      .where('uploadType', '==', 'guest')
+      .where('approved', '==', true)
+      .orderBy('uploadedAt', 'desc')
+      .get();
+    
+    const guestPhotos = guestPhotosSnapshot.docs.map(doc => doc.data());
 
     res.json({
       event,
@@ -322,22 +316,28 @@ app.get('/api/events/:eventId', async (req, res) => {
   }
 });
 
-// Upload Guest Photo
+// Upload Guest Photo - FIRESTORE VERSION
 app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   try {
-    const event = await Event.findOne({ eventId: req.params.eventId });
-    if (!event || event.status === 'disabled' || event.serviceType === 'viewalbum') {
+    const eventDoc = await db.collection('events').doc(req.params.eventId).get();
+    if (!eventDoc.exists) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    const event = eventDoc.data();
+    
+    if (event.status === 'disabled' || event.serviceType === 'viewalbum') {
       return res.status(400).json({ error: 'Uploads not allowed' });
     }
 
     // Check upload limit
-    const guestUploadsCount = await Photo.countDocuments({ 
-      eventId: req.params.eventId, 
-      uploadType: 'guest',
-      'uploaderInfo.ip': req.ip 
-    });
+    const guestPhotosSnapshot = await db.collection('photos')
+      .where('eventId', '==', req.params.eventId)
+      .where('uploadType', '==', 'guest')
+      .where('uploaderInfo.ip', '==', req.ip)
+      .get();
 
-    if (guestUploadsCount >= event.uploadLimit) {
+    if (guestPhotosSnapshot.size >= event.uploadLimit) {
       return res.status(400).json({ error: 'Upload limit reached' });
     }
 
@@ -350,29 +350,51 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       quality: 'auto'
     });
 
-    // Save to database
-    const photo = new Photo({
+    // Save to Firestore
+    const photoData = {
       eventId: req.params.eventId,
       public_id: uploadResult.public_id,
       url: uploadResult.secure_url,
       uploadType: 'guest',
-      uploaderInfo: { ip: req.ip, userAgent: req.get('User-Agent') }
-    });
+      uploaderInfo: { 
+        ip: req.ip, 
+        userAgent: req.get('User-Agent') 
+      },
+      approved: true,
+      uploadedAt: new Date()
+    };
 
-    await photo.save();
+    await db.collection('photos').add(photoData);
 
-    res.json({ success: true, photo });
+    res.json({ success: true, photo: photoData });
   } catch (error) {
     console.error('Upload API error:', error);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
 
-// Get Album Photos
+// Get Album Photos - FIRESTORE VERSION
 app.get('/api/album/:eventId', async (req, res) => {
   try {
-    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
-    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
+    // Get preloaded photos
+    const preloadedPhotosSnapshot = await db.collection('photos')
+      .where('eventId', '==', req.params.eventId)
+      .where('uploadType', '==', 'preloaded')
+      .orderBy('uploadedAt', 'desc')
+      .get();
+    
+    const preloadedPhotos = preloadedPhotosSnapshot.docs.map(doc => doc.data());
+
+    // Get guest photos
+    const guestPhotosSnapshot = await db.collection('photos')
+      .where('eventId', '==', req.params.eventId)
+      .where('uploadType', '==', 'guest')
+      .where('approved', '==', true)
+      .orderBy('uploadedAt', 'desc')
+      .get();
+    
+    const guestPhotos = guestPhotosSnapshot.docs.map(doc => doc.data());
+
     res.json({ preloadedPhotos, guestPhotos });
   } catch (error) {
     console.error('Album API error:', error);
