@@ -4,14 +4,6 @@ const cors = require('cors');
 const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
-const admin = require('firebase-admin');
-
-// Firebase Admin Initialization
-const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-const db = admin.firestore();
 
 const app = express();
 app.use(cors());
@@ -23,6 +15,10 @@ cloudinary.config({
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
+
+// In-memory storage (for testing only)
+const events = new Map();
+const photos = new Map();
 
 // Telegram Bot
 let bot;
@@ -51,34 +47,29 @@ const autoCompleteEvent = async (ctx, userState) => {
   try {
     await ctx.reply('⏳ All photos received! Creating your event...');
 
-    // SAVE EVENT TO FIRESTORE
+    // SAVE EVENT TO MEMORY
     const eventData = {
       ...userState.eventData,
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
-    await db.collection('events').doc(userState.eventData.eventId).set(eventData);
-    console.log('✅ Event saved to Firestore');
+    events.set(userState.eventData.eventId, eventData);
+    console.log('✅ Event saved to memory');
 
-    // SAVE PRELOADED PHOTOS TO FIRESTORE
+    // SAVE PRELOADED PHOTOS TO MEMORY
     if (userState.eventData.preloadedPhotos.length > 0) {
-      console.log('💾 Saving photos to Firestore...');
+      console.log('💾 Saving photos to memory...');
       
-      for (const photo of userState.eventData.preloadedPhotos) {
-        const photoData = {
-          eventId: userState.eventData.eventId,
-          public_id: photo.public_id,
-          url: photo.url,
-          uploadType: 'preloaded',
-          uploadedAt: photo.uploadedAt || new Date(),
-          approved: true
-        };
-        
-        await db.collection('photos').add(photoData);
-        console.log('✅ Photo saved:', photo.public_id);
-      }
-      console.log('🎊 All photos saved to Firestore');
+      const eventPhotos = userState.eventData.preloadedPhotos.map(photo => ({
+        ...photo,
+        eventId: userState.eventData.eventId,
+        uploadType: 'preloaded',
+        approved: true
+      }));
+      
+      photos.set(userState.eventData.eventId, eventPhotos);
+      console.log('🎊 All photos saved to memory');
     }
 
     const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
@@ -192,15 +183,14 @@ if (bot) {
 
       case 'eventIdForDisable':
         try {
-          const eventDoc = await db.collection('events').doc(text).get();
-          if (!eventDoc.exists) {
+          const event = events.get(text);
+          if (!event) {
             await ctx.reply('❌ Event not found');
             return;
           }
-          await db.collection('events').doc(text).update({
-            status: 'disabled',
-            updatedAt: new Date()
-          });
+          event.status = 'disabled';
+          event.updatedAt = new Date();
+          events.set(text, event);
           await ctx.reply(`✅ Uploads disabled for event: ${text}`);
         } catch (error) {
           await ctx.reply('❌ Failed to disable event');
@@ -275,34 +265,17 @@ const upload = multer({ storage: storage });
 
 // API Routes
 
-// Get Event Details - FIRESTORE VERSION
+// Get Event Details - MEMORY VERSION
 app.get('/api/events/:eventId', async (req, res) => {
   try {
-    const eventDoc = await db.collection('events').doc(req.params.eventId).get();
-    if (!eventDoc.exists) {
+    const event = events.get(req.params.eventId);
+    if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    const event = eventDoc.data();
-
-    // Get preloaded photos
-    const preloadedPhotosSnapshot = await db.collection('photos')
-      .where('eventId', '==', req.params.eventId)
-      .where('uploadType', '==', 'preloaded')
-      .orderBy('uploadedAt', 'desc')
-      .get();
-    
-    const preloadedPhotos = preloadedPhotosSnapshot.docs.map(doc => doc.data());
-
-    // Get guest photos
-    const guestPhotosSnapshot = await db.collection('photos')
-      .where('eventId', '==', req.params.eventId)
-      .where('uploadType', '==', 'guest')
-      .where('approved', '==', true)
-      .orderBy('uploadedAt', 'desc')
-      .get();
-    
-    const guestPhotos = guestPhotosSnapshot.docs.map(doc => doc.data());
+    const eventPhotos = photos.get(req.params.eventId) || [];
+    const preloadedPhotos = eventPhotos.filter(photo => photo.uploadType === 'preloaded');
+    const guestPhotos = eventPhotos.filter(photo => photo.uploadType === 'guest' && photo.approved);
 
     res.json({
       event,
@@ -316,28 +289,21 @@ app.get('/api/events/:eventId', async (req, res) => {
   }
 });
 
-// Upload Guest Photo - FIRESTORE VERSION
+// Upload Guest Photo - MEMORY VERSION
 app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   try {
-    const eventDoc = await db.collection('events').doc(req.params.eventId).get();
-    if (!eventDoc.exists) {
-      return res.status(404).json({ error: 'Event not found' });
-    }
-
-    const event = eventDoc.data();
-    
-    if (event.status === 'disabled' || event.serviceType === 'viewalbum') {
+    const event = events.get(req.params.eventId);
+    if (!event || event.status === 'disabled' || event.serviceType === 'viewalbum') {
       return res.status(400).json({ error: 'Uploads not allowed' });
     }
 
     // Check upload limit
-    const guestPhotosSnapshot = await db.collection('photos')
-      .where('eventId', '==', req.params.eventId)
-      .where('uploadType', '==', 'guest')
-      .where('uploaderInfo.ip', '==', req.ip)
-      .get();
+    const eventPhotos = photos.get(req.params.eventId) || [];
+    const guestUploadsCount = eventPhotos.filter(photo => 
+      photo.uploadType === 'guest' && photo.uploaderInfo?.ip === req.ip
+    ).length;
 
-    if (guestPhotosSnapshot.size >= event.uploadLimit) {
+    if (guestUploadsCount >= event.uploadLimit) {
       return res.status(400).json({ error: 'Upload limit reached' });
     }
 
@@ -350,7 +316,7 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       quality: 'auto'
     });
 
-    // Save to Firestore
+    // Save to memory
     const photoData = {
       eventId: req.params.eventId,
       public_id: uploadResult.public_id,
@@ -364,7 +330,9 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
       uploadedAt: new Date()
     };
 
-    await db.collection('photos').add(photoData);
+    const currentPhotos = photos.get(req.params.eventId) || [];
+    currentPhotos.push(photoData);
+    photos.set(req.params.eventId, currentPhotos);
 
     res.json({ success: true, photo: photoData });
   } catch (error) {
@@ -373,27 +341,12 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   }
 });
 
-// Get Album Photos - FIRESTORE VERSION
+// Get Album Photos - MEMORY VERSION
 app.get('/api/album/:eventId', async (req, res) => {
   try {
-    // Get preloaded photos
-    const preloadedPhotosSnapshot = await db.collection('photos')
-      .where('eventId', '==', req.params.eventId)
-      .where('uploadType', '==', 'preloaded')
-      .orderBy('uploadedAt', 'desc')
-      .get();
-    
-    const preloadedPhotos = preloadedPhotosSnapshot.docs.map(doc => doc.data());
-
-    // Get guest photos
-    const guestPhotosSnapshot = await db.collection('photos')
-      .where('eventId', '==', req.params.eventId)
-      .where('uploadType', '==', 'guest')
-      .where('approved', '==', true)
-      .orderBy('uploadedAt', 'desc')
-      .get();
-    
-    const guestPhotos = guestPhotosSnapshot.docs.map(doc => doc.data());
+    const eventPhotos = photos.get(req.params.eventId) || [];
+    const preloadedPhotos = eventPhotos.filter(photo => photo.uploadType === 'preloaded');
+    const guestPhotos = eventPhotos.filter(photo => photo.uploadType === 'guest' && photo.approved);
 
     res.json({ preloadedPhotos, guestPhotos });
   } catch (error) {
@@ -404,14 +357,34 @@ app.get('/api/album/:eventId', async (req, res) => {
 
 // Health Check
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    eventsCount: events.size,
+    photosCount: photos.size
+  });
+});
+
+// Debug route to see all events
+app.get('/api/debug/events', (req, res) => {
+  const allEvents = Array.from(events.entries()).map(([id, event]) => ({
+    id,
+    ...event
+  }));
+  res.json({ total: events.size, events: allEvents });
 });
 
 app.get('/', (req, res) => {
-  res.json({ message: 'Event Photo Backend is running!' });
+  res.json({ 
+    message: 'Event Photo Backend is running!',
+    storage: 'In-memory (No Database)',
+    events: events.size,
+    photos: photos.size
+  });
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`💾 Using in-memory storage (no database)`);
 });
